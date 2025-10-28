@@ -1,0 +1,9 @@
+[project]
+name = "gm-pot"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "patchright>=1.55.2",
+    "python-dotenv>=1.2.1",
+    "xvfbwrapper>=0.2.15",
+]
