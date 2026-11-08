@@ -1,8 +1,10 @@
 import argparse
 import base64
 import json
+import logging
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from os import getenv
 from pathlib import Path
 from time import sleep, time
@@ -25,6 +27,8 @@ PROFILE_DIR = Path(getenv("PROFILE_DIR", "./profile"))
 SCREENSHOT_DIR = Path(getenv("SCREENSHOT_DIR", "./screenshot"))
 LOG_DIR = Path(getenv("LOG_DIR", "./logs"))
 AUTH_LOG = LOG_DIR / "auth.log"
+AUTH_LOG_MAX_BYTES = int(getenv("AUTH_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
+AUTH_LOG_BACKUPS = int(getenv("AUTH_LOG_BACKUPS", "3"))
 
 EMAIL_SELECTORS = (
     "#email-or-phone,"
@@ -47,15 +51,33 @@ AUTH_ENDPOINTS = (
     "/api/auth/logout",
 )
 AUTH_RESPONSES: deque = deque()
+_auth_logger: logging.Logger | None = None
+
+
+def get_auth_logger() -> logging.Logger:
+    global _auth_logger
+    if _auth_logger is None:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("gm-pot-auth")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        handler = RotatingFileHandler(
+            AUTH_LOG,
+            maxBytes=AUTH_LOG_MAX_BYTES,
+            backupCount=AUTH_LOG_BACKUPS,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+        _auth_logger = logger
+    return _auth_logger
 
 
 def auth_log(message: str) -> None:
     line = f"{datetime.now(timezone.utc).isoformat()} {message}"
     print(line)
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with AUTH_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        get_auth_logger().info(line)
     except OSError as e:
         print(f"Could not write auth log: {e}")
 
