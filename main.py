@@ -49,6 +49,20 @@ SUBMIT_SELECTOR = 'form button[type="submit"]'
 
 TOKEN_COOKIES = ("access_token", "refresh_token")
 
+TRANSIENT_NETWORK_ERRORS = (
+    "ERR_NETWORK_CHANGED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_TIMED_OUT",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_NETWORK_ACCESS_DENIED",
+)
+GOTO_MAX_ATTEMPTS = int(getenv("GOTO_MAX_ATTEMPTS", "4"))
+
 AUTH_ENDPOINTS = (
     "/api/auth/login",
     "/api/auth/refresh",
@@ -229,6 +243,27 @@ def solve_cloudflare(page: Page) -> None:
     print("Cloudflare turnstile not solved, continuing anyway")
 
 
+def goto(page: Page, url: str, timeout: int = 60000) -> None:
+    last_error = None
+    for attempt in range(1, GOTO_MAX_ATTEMPTS + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return
+        except Exception as e:
+            last_error = e
+            message = str(e)
+            if not any(code in message for code in TRANSIENT_NETWORK_ERRORS):
+                raise
+            auth_log(
+                f"goto_retry attempt={attempt} url={url} "
+                f"error={message.splitlines()[0][:200]}"
+            )
+            if attempt < GOTO_MAX_ATTEMPTS:
+                page.wait_for_timeout(2000 * attempt)
+    if last_error is not None:
+        raise last_error
+
+
 def login(page: Page, ctx: BrowserContext) -> None:
     email = getenv("EMAIL")
     password = getenv("PASSWORD")
@@ -238,7 +273,7 @@ def login(page: Page, ctx: BrowserContext) -> None:
     print("Opening login page...")
     auth_log(f"login_start url={page.url}")
     try:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        goto(page, LOGIN_URL)
         solve_cloudflare(page)
 
         email_input = page.locator(EMAIL_SELECTORS).first
@@ -270,7 +305,7 @@ def ensure_logged_in(page: Page, ctx: BrowserContext) -> None:
     if has_tokens(ctx):
         print("Trying saved session...")
         auth_log(f"session_check_start url={page.url} {token_state(ctx)}")
-        page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+        goto(page, NFT_MINERS_URL)
         drain_auth_responses()
         if not is_logged_out(page):
             try:
@@ -286,19 +321,19 @@ def ensure_logged_in(page: Page, ctx: BrowserContext) -> None:
             auth_log(f"session_rejected url={page.url} {token_state(ctx)}")
 
     login(page, ctx)
-    page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+    goto(page, NFT_MINERS_URL)
     page.wait_for_selector(NFT_MINERS_SELECTOR, timeout=60000)
     drain_auth_responses()
 
 
 def skip_intro(page: Page) -> None:
     if "/nft-miners" not in page.url:
-        page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+        goto(page, NFT_MINERS_URL)
     page.wait_for_selector(NFT_MINERS_SELECTOR, timeout=60000)
 
     for _ in range(50):
         if "/nft-miners" not in page.url:
-            page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+            goto(page, NFT_MINERS_URL)
             page.wait_for_selector(NFT_MINERS_SELECTOR, timeout=60000)
 
         try:
@@ -348,7 +383,7 @@ def read_cooldown(page: Page) -> float:
 
 def try_service(page: Page, allow_click: bool = True) -> float:
     for _ in range(3):
-        page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+        goto(page, NFT_MINERS_URL)
         page.wait_for_selector(SERVICE_BUTTON_SELECTOR, timeout=60000)
         page.wait_for_timeout(1000)
         drain_auth_responses()
