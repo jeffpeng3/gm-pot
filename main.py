@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from os import getenv
@@ -29,6 +30,11 @@ LOG_DIR = Path(getenv("LOG_DIR", "./logs"))
 AUTH_LOG = LOG_DIR / "auth.log"
 AUTH_LOG_MAX_BYTES = int(getenv("AUTH_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 AUTH_LOG_BACKUPS = int(getenv("AUTH_LOG_BACKUPS", "3"))
+RUNTIME_FILE = Path(getenv("RUNTIME_FILE", "./state/runtime.json"))
+
+MAX_SLEEP_CHUNK_SECONDS = int(getenv("MAX_SLEEP_CHUNK_SECONDS", str(6 * 3600)))
+ERROR_RETRY_SECONDS = int(getenv("ERROR_RETRY_SECONDS", "300"))
+SERVICE_RETRY_SECONDS = int(getenv("SERVICE_RETRY_SECONDS", "300"))
 
 EMAIL_SELECTORS = (
     "#email-or-phone,"
@@ -40,9 +46,6 @@ PASSWORD_SELECTORS = '#password, input[autocomplete="current-password"]'
 SUBMIT_SELECTOR = 'form button[type="submit"]'
 
 TOKEN_COOKIES = ("access_token", "refresh_token")
-KEEPALIVE_INTERVAL_SECONDS = 10
-VISIBILITY_CHECK_INTERVAL_SECONDS = 60
-REFRESH_NAVIGATION_INTERVAL_SECONDS = 900
 
 AUTH_ENDPOINTS = (
     "/api/auth/login",
@@ -166,16 +169,6 @@ def take_screenshot(page: Page, name: str) -> None:
         print(f"Screenshot failed: {e}")
 
 
-def token_signature(ctx: BrowserContext) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        sorted(
-            (cookie["name"], cookie["value"])
-            for cookie in ctx.cookies()
-            if cookie["name"] in TOKEN_COOKIES
-        )
-    )
-
-
 def has_tokens(ctx: BrowserContext) -> bool:
     return any(
         cookie["name"] in TOKEN_COOKIES and cookie["value"]
@@ -297,7 +290,8 @@ def ensure_logged_in(page: Page, ctx: BrowserContext) -> None:
 
 
 def skip_intro(page: Page) -> None:
-    page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
+    if "/nft-miners" not in page.url:
+        page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_selector(NFT_MINERS_SELECTOR, timeout=60000)
 
     for _ in range(50):
@@ -377,54 +371,81 @@ def try_service(page: Page, allow_click: bool = True) -> float:
     return 300
 
 
-def keep_alive(page: Page, ctx: BrowserContext, seconds: float) -> None:
-    deadline = time() + max(0.0, seconds)
-    last_signature = token_signature(ctx)
-    last_visibility_check = 0.0
-    last_navigation = time()
+def load_next_run() -> float | None:
+    try:
+        data = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("next_run_at") if isinstance(data, dict) else None
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
-    while time() < deadline:
-        sleep(min(KEEPALIVE_INTERVAL_SECONDS, max(0.5, deadline - time())))
-        drain_auth_responses()
 
-        now = time()
-        if now - last_visibility_check >= VISIBILITY_CHECK_INTERVAL_SECONDS:
-            last_visibility_check = now
+def save_next_run(next_run_at: float, cooldown: float) -> None:
+    RUNTIME_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RUNTIME_FILE.with_name(f"{RUNTIME_FILE.name}.tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "next_run_at": next_run_at,
+                "cooldown_seconds": cooldown,
+                "updated_at": time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    tmp.replace(RUNTIME_FILE)
+
+
+def clear_next_run() -> None:
+    try:
+        RUNTIME_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"Could not remove runtime file: {e}")
+
+
+def sleep_until(timestamp: float) -> None:
+    while True:
+        remaining = timestamp - time()
+        if remaining <= 0:
+            return
+        sleep(min(remaining, MAX_SLEEP_CHUNK_SECONDS))
+
+
+@contextmanager
+def browser_session():
+    xvfb = Xvfb()
+    xvfb.start()
+    playwright = None
+    ctx = None
+    try:
+        playwright = sync_playwright().start()
+        ctx = launch_context(playwright)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        attach_auth_logging(page)
+        auth_log("session_start")
+        yield ctx, page
+    finally:
+        if ctx is not None:
             try:
-                if page.evaluate("document.visibilityState") != "visible":
-                    page.bring_to_front()
+                drain_auth_responses()
+                auth_log(f"session_end {token_state(ctx)}")
+                ctx.close()
+            except Exception as e:
+                print(f"Could not close browser session: {e}")
+        if playwright is not None:
+            try:
+                playwright.stop()
             except Exception:
                 pass
-
-        if now - last_navigation >= REFRESH_NAVIGATION_INTERVAL_SECONDS:
-            last_navigation = now
-            try:
-                auth_log("refresh_navigation_start")
-                page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_selector(NFT_MINERS_SELECTOR, timeout=60000)
-                drain_auth_responses()
-            except Exception as e:
-                print(f"Refresh navigation failed: {e}")
-                auth_log(f"refresh_navigation_error error={type(e).__name__}: {e}")
-
         try:
-            signature = token_signature(ctx)
-        except Exception as e:
-            print(f"Could not read cookies: {e}")
-            continue
-
-        if signature != last_signature:
-            last_signature = signature
-            print("Token refreshed")
-            auth_log(f"token_refreshed {token_state(ctx)}")
-
-        if is_logged_out(page):
-            print("Session lost while waiting, logging in again")
-            auth_log(f"session_lost url={page.url} {token_state(ctx)}")
-            ensure_logged_in(page, ctx)
-            page.goto(NFT_MINERS_URL, wait_until="domcontentloaded", timeout=60000)
-            drain_auth_responses()
-            last_signature = token_signature(ctx)
+            xvfb.stop()
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -434,73 +455,67 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="login and verify the session, but never click the service button",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ignore the saved next run time and work immediately",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
-    xvfb = Xvfb()
-    xvfb.start()
-
     auth_log("process_start")
-    playwright = sync_playwright().start()
-    ctx = None
+
+    if args.force:
+        clear_next_run()
+
+    if not args.dry_run and not args.force:
+        next_run_at = load_next_run()
+        if next_run_at is not None and next_run_at > time():
+            wait = next_run_at - time()
+            auth_log(
+                f"resume_wait seconds={int(wait)} next_run_at={int(next_run_at)}"
+            )
+            sleep_until(next_run_at)
+            auth_log("resume_wait_end")
 
     try:
-        ctx = launch_context(playwright)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        attach_auth_logging(page)
-
-        ensure_logged_in(page, ctx)
-
-        if args.dry_run:
-            print("Dry run: service button will not be clicked")
-            remaining = try_service(page, allow_click=False)
-            drain_auth_responses()
-            if remaining > 0:
-                print(f"Service cooldown: {remaining:.0f} seconds")
-            else:
-                print("Service is available")
-            take_screenshot(page, "dry-run.png")
-            print(f"Browser profile: {PROFILE_DIR.resolve()}")
-            return
-
-        skip_intro(page)
-
         while True:
+            wait = ERROR_RETRY_SECONDS
             try:
-                wait = try_service(page)
-            except Exception as e:
-                print(f"Error occurred: {e}")
-                auth_log(f"service_error error={type(e).__name__}: {e}")
-                take_screenshot(page, "error_screenshot.png")
-                try:
+                with browser_session() as (ctx, page):
                     ensure_logged_in(page, ctx)
-                except Exception as login_error:
-                    print(f"Could not log in again: {login_error}")
-                    auth_log(
-                        f"relogin_error error={type(login_error).__name__}: {login_error}"
-                    )
-                wait = 60
 
-            if wait <= 0:
-                wait = 5
+                    if args.dry_run:
+                        print("Dry run: service button will not be clicked")
+                        remaining = try_service(page, allow_click=False)
+                        drain_auth_responses()
+                        if remaining > 0:
+                            print(f"Service cooldown: {remaining:.0f} seconds")
+                        else:
+                            print("Service is available")
+                        take_screenshot(page, "dry-run.png")
+                        print(f"Browser profile: {PROFILE_DIR.resolve()}")
+                        return
 
-            keep_alive(page, ctx, wait)
+                    skip_intro(page)
+                    wait = try_service(page)
+                    if wait <= 0:
+                        wait = SERVICE_RETRY_SECONDS
+            except Exception as e:
+                auth_log(f"cycle_error error={type(e).__name__}: {e}")
+                wait = ERROR_RETRY_SECONDS
+
+            next_run_at = time() + wait
+            save_next_run(next_run_at, wait)
+            auth_log(
+                f"sleep_start seconds={int(wait)} next_run_at={int(next_run_at)}"
+            )
+            sleep_until(next_run_at)
+            auth_log("sleep_end")
     except KeyboardInterrupt:
-        print("Stopped")
         auth_log("process_stopped")
-    finally:
-        if ctx is not None:
-            try:
-                drain_auth_responses()
-                auth_log(f"process_end {token_state(ctx)}")
-                ctx.close()
-            except Exception:
-                pass
-        playwright.stop()
-        xvfb.stop()
 
 
 if __name__ == "__main__":

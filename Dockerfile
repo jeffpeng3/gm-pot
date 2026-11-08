@@ -22,9 +22,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV PROFILE_DIR=/app/profile
 ENV LOG_DIR=/app/logs
+ENV RUNTIME_FILE=/app/state/runtime.json
 
-RUN mkdir -p /app/profile /app/logs
-VOLUME ["/app/profile"]
+RUN mkdir -p /app/profile /app/logs /app/state
+VOLUME ["/app/profile", "/app/state"]
 
 WORKDIR /app
 
