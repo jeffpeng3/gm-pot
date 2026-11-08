@@ -13,11 +13,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN uv run patchright install chromium --with-deps
 
-RUN apt-get install xvfb -y
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xvfb \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/app/.venv/bin:$PATH"
 
 ENV PYTHONUNBUFFERED=1
+ENV PROFILE_DIR=/app/profile
+ENV LOG_DIR=/app/logs
+
+RUN mkdir -p /app/profile /app/logs
+VOLUME ["/app/profile"]
 
 WORKDIR /app
 

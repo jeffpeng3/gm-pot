@@ -1,0 +1,10 @@
+.git
+.github
+.venv
+.env
+state
+profile
+screenshot
+logs
+__pycache__
+*.pyc

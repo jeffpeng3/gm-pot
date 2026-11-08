@@ -1,1 +1,8 @@
 .env
+.venv/
+state/
+profile/
+screenshot/
+logs/
+__pycache__/
+*.pyc
