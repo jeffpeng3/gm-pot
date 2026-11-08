@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 from collections import deque
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from os import getenv
@@ -32,7 +31,10 @@ AUTH_LOG_MAX_BYTES = int(getenv("AUTH_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 AUTH_LOG_BACKUPS = int(getenv("AUTH_LOG_BACKUPS", "3"))
 RUNTIME_FILE = Path(getenv("RUNTIME_FILE", "./state/runtime.json"))
 
-MAX_SLEEP_CHUNK_SECONDS = int(getenv("MAX_SLEEP_CHUNK_SECONDS", str(6 * 3600)))
+MAX_SLEEP_CHUNK_SECONDS = int(getenv("MAX_SLEEP_CHUNK_SECONDS", str(24 * 3600)))
+BROWSER_KEEPALIVE_MAX_SECONDS = int(
+    getenv("BROWSER_KEEPALIVE_MAX_SECONDS", str(10 * 60))
+)
 ERROR_RETRY_SECONDS = int(getenv("ERROR_RETRY_SECONDS", "300"))
 SERVICE_RETRY_SECONDS = int(getenv("SERVICE_RETRY_SECONDS", "300"))
 
@@ -416,36 +418,44 @@ def sleep_until(timestamp: float) -> None:
         sleep(min(remaining, MAX_SLEEP_CHUNK_SECONDS))
 
 
-@contextmanager
-def browser_session():
-    xvfb = Xvfb()
-    xvfb.start()
-    playwright = None
-    ctx = None
-    try:
-        playwright = sync_playwright().start()
-        ctx = launch_context(playwright)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        attach_auth_logging(page)
+class BrowserSession:
+    def __init__(self) -> None:
+        self.xvfb: Xvfb | None = None
+        self.playwright: Playwright | None = None
+        self.ctx: BrowserContext | None = None
+        self.page: Page | None = None
+
+    def open(self) -> None:
+        self.xvfb = Xvfb()
+        self.xvfb.start()
+        self.playwright = sync_playwright().start()
+        self.ctx = launch_context(self.playwright)
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        attach_auth_logging(self.page)
         auth_log("session_start")
-        yield ctx, page
-    finally:
-        if ctx is not None:
+
+    def close(self) -> None:
+        if self.ctx is not None:
             try:
                 drain_auth_responses()
-                auth_log(f"session_end {token_state(ctx)}")
-                ctx.close()
+                auth_log(f"session_end {token_state(self.ctx)}")
+                self.ctx.close()
             except Exception as e:
                 print(f"Could not close browser session: {e}")
-        if playwright is not None:
+            self.ctx = None
+        if self.playwright is not None:
             try:
-                playwright.stop()
+                self.playwright.stop()
             except Exception:
                 pass
-        try:
-            xvfb.stop()
-        except Exception:
-            pass
+            self.playwright = None
+        if self.xvfb is not None:
+            try:
+                self.xvfb.stop()
+            except Exception:
+                pass
+            self.xvfb = None
+        self.page = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -480,11 +490,23 @@ def main() -> None:
             sleep_until(next_run_at)
             auth_log("resume_wait_end")
 
+    session: BrowserSession | None = None
     try:
         while True:
+            fresh_session = session is None
             wait = ERROR_RETRY_SECONDS
+
             try:
-                with browser_session() as (ctx, page):
+                if fresh_session:
+                    session = BrowserSession()
+                    session.open()
+
+                ctx = session.ctx
+                page = session.page
+                if ctx is None or page is None:
+                    raise RuntimeError("Browser session is not initialized")
+
+                if fresh_session:
                     ensure_logged_in(page, ctx)
 
                     if args.dry_run:
@@ -500,15 +522,34 @@ def main() -> None:
                         return
 
                     skip_intro(page)
-                    wait = try_service(page)
-                    if wait <= 0:
-                        wait = SERVICE_RETRY_SECONDS
+
+                wait = try_service(page)
+                if wait <= 0:
+                    wait = SERVICE_RETRY_SECONDS
             except Exception as e:
                 auth_log(f"cycle_error error={type(e).__name__}: {e}")
+                if session is not None:
+                    session.close()
+                    session = None
+                if args.dry_run:
+                    raise
                 wait = ERROR_RETRY_SECONDS
 
             next_run_at = time() + wait
             save_next_run(next_run_at, wait)
+
+            if session is not None and wait <= BROWSER_KEEPALIVE_MAX_SECONDS:
+                auth_log(
+                    f"browser_wait seconds={int(wait)} next_run_at={int(next_run_at)}"
+                )
+                sleep_until(next_run_at)
+                auth_log("browser_wait_end")
+                continue
+
+            if session is not None:
+                session.close()
+                session = None
+
             auth_log(
                 f"sleep_start seconds={int(wait)} next_run_at={int(next_run_at)}"
             )
@@ -516,6 +557,9 @@ def main() -> None:
             auth_log("sleep_end")
     except KeyboardInterrupt:
         auth_log("process_stopped")
+    finally:
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":
